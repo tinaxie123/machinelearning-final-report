@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+venv_py*/
+env/
+ENV/
+.venv
+
+# Data files
+*.pkl
+*.npz
+*.csv
+*.txt
+*.bin
+*.model
+*.ckpt
+*.dat
+*.h5
+*.hdf5
+
+# Model files
+models/
+features/
+THUCNews/data/
+THUCNews/saved_dict/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+PROJECT_SUMMARY.md
