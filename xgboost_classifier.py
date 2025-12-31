@@ -1,132 +1,209 @@
-"""
-XGBoost分类器
-梯度提升决策树，使用二阶梯度优化
-"""
-
 import numpy as np
 import pickle
-from xgboost import XGBClassifier
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from decision_tree import DecisionTreeNode
+from metrics import classification_report, confusion_matrix, f1_score
 import time
 
 
+class XGBoostTree:
+    def __init__(self, max_depth=6, reg_lambda=1.0, reg_alpha=0.0, gamma=0.0, min_child_weight=1):
+        self.max_depth = max_depth
+        self.reg_lambda = reg_lambda
+        self.reg_alpha = reg_alpha
+        self.gamma = gamma
+        self.min_child_weight = min_child_weight
+        self.root = None
+
+    def calculate_leaf_weight(self, grad, hess):
+        G = np.sum(grad)
+        H = np.sum(hess)
+        weight = -G / (H + self.reg_lambda)
+        return weight
+
+    def calculate_split_gain(self, grad_left, hess_left, grad_right, hess_right):
+        GL = np.sum(grad_left)
+        HL = np.sum(hess_left)
+        GR = np.sum(grad_right)
+        HR = np.sum(hess_right)
+
+        gain = 0.5 * (
+            (GL ** 2) / (HL + self.reg_lambda) +
+            (GR ** 2) / (HR + self.reg_lambda) -
+            ((GL + GR) ** 2) / (HL + HR + self.reg_lambda)
+        ) - self.gamma
+
+        return gain
+
+    def find_best_split(self, X, grad, hess):
+        n_samples, n_features = X.shape
+        best_gain = -float('inf')
+        best_feature_idx = None
+        best_threshold = None
+
+        for feature_idx in range(n_features):
+            feature_values = X[:, feature_idx]
+            unique_values = np.unique(feature_values)
+
+            for threshold in unique_values:
+                left_mask = feature_values <= threshold
+                right_mask = ~left_mask
+
+                if np.sum(hess[left_mask]) < self.min_child_weight or np.sum(hess[right_mask]) < self.min_child_weight:
+                    continue
+
+                gain = self.calculate_split_gain(
+                    grad[left_mask], hess[left_mask],
+                    grad[right_mask], hess[right_mask]
+                )
+
+                if gain > best_gain:
+                    best_gain = gain
+                    best_feature_idx = feature_idx
+                    best_threshold = threshold
+
+        return best_feature_idx, best_threshold, best_gain
+
+    def build_tree(self, X, grad, hess, depth=0):
+        node = DecisionTreeNode()
+
+        if depth >= self.max_depth or len(X) == 0:
+            node.is_leaf = True
+            node.value = self.calculate_leaf_weight(grad, hess)
+            return node
+
+        feature_idx, threshold, gain = self.find_best_split(X, grad, hess)
+
+        if feature_idx is None or gain <= 0:
+            node.is_leaf = True
+            node.value = self.calculate_leaf_weight(grad, hess)
+            return node
+
+        left_mask = X[:, feature_idx] <= threshold
+        right_mask = ~left_mask
+
+        node.feature_idx = feature_idx
+        node.threshold = threshold
+        node.left = self.build_tree(X[left_mask], grad[left_mask], hess[left_mask], depth + 1)
+        node.right = self.build_tree(X[right_mask], grad[right_mask], hess[right_mask], depth + 1)
+
+        return node
+
+    def fit(self, X, grad, hess):
+        self.root = self.build_tree(X, grad, hess, depth=0)
+        return self
+
+    def predict_sample(self, x, node):
+        if node.is_leaf:
+            return node.value
+
+        if x[node.feature_idx] <= node.threshold:
+            return self.predict_sample(x, node.left)
+        else:
+            return self.predict_sample(x, node.right)
+
+    def predict(self, X):
+        return np.array([self.predict_sample(x, self.root) for x in X])
+
+
 class XGBoostClassifier:
-    """
-    XGBoost分类器
-
-    加法模型: y_i = Σ f_k(x_i), f_k ∈ F
-
-    优化目标:
-    L(φ) = Σ l(yi, ŷi) + Σ Ω(fk)
-    其中 Ω(f) = γT + 1/2 λ||w||²
-
-    使用一阶和二阶梯度:
-    gi = ∂l/∂ŷ(t-1)
-    hi = ∂²l/∂ŷ(t-1)²
-
-    节点分裂增益:
-    Gain = 1/2 [GL²/(HL+λ) + GR²/(HR+λ) - (GL+GR)²/(HL+HR+λ)] - γ
-    """
-
     def __init__(self, n_estimators=100, max_depth=6, learning_rate=0.1,
                  reg_lambda=1.0, reg_alpha=0.0, random_state=42):
-        """
-        初始化XGBoost分类器
-
-        Args:
-            n_estimators: 树的数量
-            max_depth: 树的最大深度
-            learning_rate: 学习率
-            reg_lambda: L2正则化参数
-            reg_alpha: L1正则化参数
-            random_state: 随机种子
-        """
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
         self.reg_lambda = reg_lambda
         self.reg_alpha = reg_alpha
         self.random_state = random_state
-        self.model_ = None
+        self.trees_ = []
         self.classes_ = None
+        self.n_classes_ = None
+        self.init_pred_ = None
+
+    def softmax(self, z):
+        z_shifted = z - np.max(z, axis=1, keepdims=True)
+        exp_z = np.exp(z_shifted)
+        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
 
     def fit(self, X, y):
-        """
-        训练模型
-
-        Args:
-            X: 训练特征，shape (n_samples, n_features)
-            y: 训练标签，shape (n_samples,)
-        """
-        print("\n" + "=" * 80)
-        print("训练XGBoost分类器")
-        print("=" * 80)
+        print("Training XGBoost Classifier")
 
         X = np.array(X)
         y = np.array(y)
+        np.random.seed(self.random_state)
 
         self.classes_ = np.unique(y)
-        n_classes = len(self.classes_)
+        self.n_classes_ = len(self.classes_)
+        n_samples = X.shape[0]
 
-        print(f"\n训练集大小: {X.shape[0]} 样本")
-        print(f"特征维度: {X.shape[1]}")
-        print(f"类别数量: {n_classes}")
-        print(f"\n模型参数:")
-        print(f"  树的数量: {self.n_estimators}")
-        print(f"  最大深度: {self.max_depth}")
-        print(f"  学习率: {self.learning_rate}")
-        print(f"  L2正则化: {self.reg_lambda}")
-        print(f"  L1正则化: {self.reg_alpha}")
+        print(f"Training set: {X.shape[0]} samples, {X.shape[1]} features, {self.n_classes_} classes")
+        print(f"Parameters: n_estimators={self.n_estimators}, max_depth={self.max_depth}, lr={self.learning_rate}")
 
-        print("\n算法特点:")
-        print("  - 使用二阶泰勒展开近似损失函数")
-        print("  - 采用正则化项控制模型复杂度")
-        print("  - 支持并行化节点分裂")
+        y_encoded = np.zeros((n_samples, self.n_classes_))
+        for i, c in enumerate(self.classes_):
+            y_encoded[y == c, i] = 1
 
-        # 初始化XGBoost模型
-        self.model_ = XGBClassifier(
-            n_estimators=self.n_estimators,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            reg_lambda=self.reg_lambda,
-            reg_alpha=self.reg_alpha,
-            random_state=self.random_state,
-            objective='multi:softmax',
-            num_class=n_classes,
-            eval_metric='mlogloss',
-            verbosity=0
-        )
+        self.init_pred_ = np.log(np.mean(y_encoded, axis=0) + 1e-10)
+        F = np.tile(self.init_pred_, (n_samples, 1))
 
-        print("\n开始训练...")
+        print("Training...")
         start_time = time.time()
-        self.model_.fit(X, y)
-        train_time = time.time() - start_time
 
-        print(f"训练完成！耗时: {train_time:.2f}秒")
+        for m in range(self.n_estimators):
+            proba = self.softmax(F)
+
+            grad = proba - y_encoded
+            hess = proba * (1 - proba)
+
+            trees_m = []
+            for k in range(self.n_classes_):
+                tree = XGBoostTree(
+                    max_depth=self.max_depth,
+                    reg_lambda=self.reg_lambda,
+                    reg_alpha=self.reg_alpha
+                )
+                tree.fit(X, grad[:, k], hess[:, k])
+                trees_m.append(tree)
+
+            self.trees_.append(trees_m)
+
+            for k in range(self.n_classes_):
+                update = trees_m[k].predict(X)
+                F[:, k] += self.learning_rate * update
+
+            if (m + 1) % 20 == 0:
+                print(f"  Progress: {m+1}/{self.n_estimators}")
+
+        train_time = time.time() - start_time
+        print(f"Training complete! Time: {train_time:.2f}s")
 
         return self
 
     def predict_proba(self, X):
-        """预测概率"""
-        self.model_.set_params(objective='multi:softprob')
-        proba = self.model_.predict_proba(X)
-        self.model_.set_params(objective='multi:softmax')
+        X = np.array(X)
+        n_samples = X.shape[0]
+
+        F = np.tile(self.init_pred_, (n_samples, 1))
+
+        for trees_m in self.trees_:
+            for k in range(self.n_classes_):
+                update = trees_m[k].predict(X)
+                F[:, k] += self.learning_rate * update
+
+        proba = self.softmax(F)
         return proba
 
     def predict(self, X):
-        """预测类别"""
-        return self.model_.predict(X)
+        proba = self.predict_proba(X)
+        y_pred_idx = np.argmax(proba, axis=1)
+        return self.classes_[y_pred_idx]
 
     def score(self, X, y):
-        """计算准确率"""
-        return self.model_.score(X, y)
+        y_pred = self.predict(X)
+        return np.mean(y_pred == y)
 
 
 def load_fused_features(file_path='features/fusion/fused_features.pkl'):
-    """加载融合特征"""
-    print("\n" + "=" * 80)
-    print("加载融合特征")
-    print("=" * 80)
+    print("Loading fused features")
 
     with open(file_path, 'rb') as f:
         data = pickle.load(f)
@@ -138,19 +215,14 @@ def load_fused_features(file_path='features/fusion/fused_features.pkl'):
     y_val = np.array(data['y_val'])
     y_test = np.array(data['y_test'])
 
-    print(f"\n训练集: {X_train.shape}")
-    print(f"验证集: {X_val.shape}")
-    print(f"测试集: {X_test.shape}")
-    print(f"权重组合: {data['weights']}")
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+    print(f"Weights: {data['weights']}")
 
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 def evaluate_model(model, X_train, y_train, X_val, y_val, X_test, y_test):
-    """评估模型性能"""
-    print("\n" + "=" * 80)
-    print("模型评估")
-    print("=" * 80)
+    print("Model evaluation")
 
     results = {}
     for name, X, y in [('train', X_train, y_train),
@@ -170,28 +242,19 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, X_test, y_test):
             'f1_weighted': f1_weighted
         }
 
-        print(f"\n[{name.upper()}]")
-        print(f"  准确率: {acc:.4f}")
-        print(f"  宏平均F1: {f1_macro:.4f}")
-        print(f"  加权平均F1: {f1_weighted:.4f}")
-        print(f"  预测时间: {pred_time:.2f}秒")
+        print(f"[{name.upper()}] Acc: {acc:.4f}, F1-macro: {f1_macro:.4f}, F1-weighted: {f1_weighted:.4f}, Time: {pred_time:.2f}s")
 
-    # 测试集详细报告
-    print("\n" + "=" * 80)
-    print("测试集详细分类报告")
-    print("=" * 80)
+    print("\nTest set classification report:")
     y_test_pred = model.predict(X_test)
     print(classification_report(y_test, y_test_pred, digits=4))
-    print("\n混淆矩阵:")
+    print("\nConfusion matrix:")
     print(confusion_matrix(y_test, y_test_pred))
 
     return results
 
 
 def main():
-    print("\n" + "=" * 80)
-    print("XGBoost分类器实验")
-    print("=" * 80)
+    print("XGBoost Classifier Experiment")
 
     X_train, X_val, X_test, y_train, y_val, y_test = load_fused_features()
 
@@ -206,11 +269,10 @@ def main():
 
     start_time = time.time()
     model.fit(X_train, y_train)
-    print(f"\n总训练时间: {time.time() - start_time:.2f}秒")
+    print(f"Total training time: {time.time() - start_time:.2f}s")
 
     results = evaluate_model(model, X_train, y_train, X_val, y_val, X_test, y_test)
 
-    # 保存模型和结果
     import os
     os.makedirs('models', exist_ok=True)
 
@@ -219,13 +281,9 @@ def main():
     with open('models/xgboost_results.pkl', 'wb') as f:
         pickle.dump(results, f)
 
-    print(f"\n模型已保存至: models/xgboost_classifier.pkl")
-    print(f"结果已保存至: models/xgboost_results.pkl")
-
-    print("\n" + "=" * 80)
-    print("实验完成！")
-    print("=" * 80)
-    print(f"\n最终结果: 测试集F1={results['test']['f1_macro']:.4f}")
+    print(f"\nModel saved to: models/xgboost_classifier.pkl")
+    print(f"Results saved to: models/xgboost_results.pkl")
+    print(f"Final result: Test F1={results['test']['f1_macro']:.4f}")
 
 
 if __name__ == '__main__':
